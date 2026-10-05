@@ -52,6 +52,11 @@ async function renderImagesMarkdown(images: CapturedImage[]): Promise<string> {
 const CONFAB_FORCE_PROMPT =
   "The working directory and the files named in the task ARE present on a real filesystem right now. Do NOT ask me to paste anything, and do NOT say commands return no output — you have not run any command yet. Emit ONE ```bash block this turn: run `ls -la` and `cat` the relevant files. Output only the ```bash block, nothing else.";
 
+// Forcing follow-up when M365 confabulates an inability to modify the repository
+// after having already used tools (e.g. read files) earlier in the conversation.
+const MID_TASK_CONFAB_FORCE_PROMPT =
+  "The local repository is present and writable. Do not ask the user to perform changes manually. Emit ONE ```bash block this turn that inspects or applies the required modifications directly, nothing else.";
+
 // Forcing follow-up when the model CLAIMS it did a file change but ran no tool.
 const HALLUCINATION_FORCE_PROMPT =
   "You have NOT actually done that — no tool ran this turn, so nothing changed on disk. Do not claim a file was created, replaced, or updated until a <tool_response> confirms it. Emit ONE ```bash block now that performs the change for real (write the file with a `cat > path <<'EOF' … EOF` heredoc), and nothing else.";
@@ -115,10 +120,10 @@ export class SessionPool {
     const existing = this.conversations.get(fingerprint);
 
     if (existing) {
-      // Messages shrunk means client restarted this conversation — reset M365 session
+      // Messages shrunk means client restarted this conversation — rotate M365 session
       if (messages.length < existing.sentMessageCount) {
-        log.info(`Conversation ${fingerprint}: messages shrunk (${messages.length} < ${existing.sentMessageCount}), resetting`);
-        existing.session.reset();
+        log.info(`Conversation ${fingerprint}: messages shrunk (${messages.length} < ${existing.sentMessageCount}), starting fresh M365 conversation`);
+        existing.session.newConversation();
         existing.sentMessageCount = 0;
       }
       existing.lastAccessedAt = Date.now();
@@ -165,9 +170,28 @@ function simpleHash(str: string): string {
   return String(hash);
 }
 
-// --- Delta message formatting ---
+function formatDeltaMessages(messages: ParsedMessage[], allMessages?: ParsedMessage[]): string {
+  const callMeta = new Map<string, { name: string; summary: string }>();
+  if (allMessages) {
+    for (const m of allMessages) {
+      if (m.role === "assistant" && m.tool_calls) {
+        for (const tc of m.tool_calls) {
+          if (tc.id) {
+            let summary = "";
+            try {
+              const args = typeof tc.function.arguments === "string" ? JSON.parse(tc.function.arguments || "{}") : (tc.function.arguments ?? {});
+              const primary = args.command ?? args.cmd ?? args.script ?? args.path ?? args.file ?? args.filename ?? args.query ?? Object.values(args).find(v => typeof v === "string");
+              if (typeof primary === "string") {
+                summary = primary.replace(/\s+/g, " ").replace(/"/g, "'").trim().slice(0, 100);
+              }
+            } catch {}
+            callMeta.set(tc.id, { name: tc.function.name, summary });
+          }
+        }
+      }
+    }
+  }
 
-function formatDeltaMessages(messages: ParsedMessage[]): string {
   const parts: string[] = [];
   for (const m of messages) {
     if (m.role === "assistant") {
@@ -175,9 +199,19 @@ function formatDeltaMessages(messages: ParsedMessage[]): string {
       // Echoing them back as a user message confuses M365.
       continue;
     } else if (m.role === "tool") {
-      const name = m.name || "unknown";
-      const callId = m.tool_call_id || "?";
-      parts.push(`<tool_response name="${name}" call_id="${callId}">\n${getMessageContent(m)}\n</tool_response>`);
+      const meta = m.tool_call_id ? callMeta.get(m.tool_call_id) : undefined;
+      const name = m.name || meta?.name || "tool";
+      const cmdAttr = meta?.summary ? ` command="${meta.summary}"` : "";
+      let content = getMessageContent(m);
+      // Tool output protection: cap at 30k chars to avoid WebSocket frame blowup or Disengaged
+      const MAX_TOOL_CHARS = 30000;
+      if (content.length > MAX_TOOL_CHARS) {
+        const head = content.slice(0, 14000);
+        const tail = content.slice(-14000);
+        const skipped = content.length - 28000;
+        content = `${head}\n\n[... truncated ${skipped} characters ...]\n\n${tail}`;
+      }
+      parts.push(`<tool_response tool="${name}"${cmdAttr}>\n${content}\n</tool_response>`);
     } else if (m.role === "system") {
       // Skip system messages on follow-up turns
     } else {
@@ -233,7 +267,7 @@ export async function handleChatCompletion(
     log.info(`Chat completion: model=${model}, stream=${body.stream}, messages=${body.messages.length}, turn=${session.turnCount}, mode=full, cid=${convId}`);
   } else {
     const newMessages = body.messages.slice(conv.sentMessageCount);
-    const delta = newMessages.length > 0 ? formatDeltaMessages(newMessages) : "";
+    const delta = newMessages.length > 0 ? formatDeltaMessages(newMessages, body.messages) : "";
     if (delta.length > 0) {
       text = delta;
       log.info(`Chat completion: model=${model}, stream=${body.stream}, messages=${body.messages.length}, new=${newMessages.length}, turn=${session.turnCount}, mode=delta, cid=${convId}`);
@@ -271,7 +305,10 @@ export async function handleChatCompletion(
     onDelta?: (delta: string) => void,
   ): Promise<{ fullText: string } | { error: Response }> {
     let agentRefreshed = false;
-    let disengageRetried = false;
+    let disengageAttempts = 0;
+    const maxDisengageRetries = process.env.M365_NO_DISENGAGE_RETRY
+      ? 0
+      : Number(process.env.M365_DISENGAGE_RETRIES ?? 2);
     const originalText = text;
     // Self-imposed pacing while the account is degraded (thread-rate throttle). A
     // no-op when healthy; during backoff it sleeps a jittered delay so we stop
@@ -337,16 +374,17 @@ export async function handleChatCompletion(
       if (copilotStream.messageType === "Disengaged") {
         // F22: the default framing's override-shape language occasionally trips Azure
         // Prompt Shields (jailbreak classifier) on benign requests (e.g. "replace X
-        // with Y, leave everything else unchanged"). Retry ONCE with the low-override
-        // `softened` framing in a FRESH conversation (a Disengaged conversation stays
-        // Disengaged). Drops the worst-case disengage ~100%→~4%. Off via
-        // M365_NO_DISENGAGE_RETRY.
-        if (hasTools && !disengageRetried && !process.env.M365_NO_DISENGAGE_RETRY) {
-          disengageRetried = true;
+        // with Y, leave everything else unchanged"). Retry with low-override framing
+        // in a FRESH conversation (a Disengaged conversation stays Disengaged). Drops
+        // worst-case disengage ~100%→~4%. Configurable via M365_DISENGAGE_RETRIES (default 2).
+        // Off via M365_NO_DISENGAGE_RETRY.
+        if (hasTools && disengageAttempts < maxDisengageRetries) {
+          disengageAttempts++;
           session.newConversation();
-          text = formatMessages(body.messages, body.tools, body.tool_choice, session.conversationId, "softened");
-          log.info("Upstream Disengaged — retrying once with 'softened' framing in a fresh conversation (F22)");
-          attempt--; // free retry; bounded — disengageRetried flips once
+          const retryFraming = disengageAttempts === 1 ? "softened" : "minimal";
+          text = formatMessages(body.messages, body.tools, body.tool_choice, session.conversationId, retryFraming);
+          log.info(`Upstream Disengaged — retrying with '${retryFraming}' framing in a fresh conversation (attempt ${disengageAttempts}/${maxDisengageRetries})`);
+          attempt--; // free retry; bounded by maxDisengageRetries
           continue;
         }
         log.info("Upstream Disengaged — failing fast (no retry) to preserve quota");
@@ -409,8 +447,8 @@ export async function handleChatCompletion(
   // out the whole (up to ~160s) M365 turn and risking a read-timeout.
   type Produced =
     | { kind: "error"; resp: Response }
-    | { kind: "text"; text: string }
-    | { kind: "tools"; toolCalls: ReturnType<typeof parseToolCalls>["toolCalls"] };
+    | { kind: "text"; text: string; reasoning?: string }
+    | { kind: "tools"; toolCalls: ReturnType<typeof parseToolCalls>["toolCalls"]; reasoning?: string };
 
   // `onDelta` streams text to the client live (non-tool path only — see produce's
   // caller). Tool mode ignores it: the raw text is parsed for tool-call fences and
@@ -422,9 +460,18 @@ export async function handleChatCompletion(
     if ("error" in result) return { kind: "error", resp: result.error };
     conv.sentMessageCount = body.messages.length;
     let fullText = result.fullText;
+    let extractedReasoning: string | undefined;
 
     log.debug("Raw response (tool mode):", trunc(fullText, 1000));
-    let parsed = parseToolCalls(fullText, body.tools);
+    const reparse = (t: string) => {
+      let p = parseToolCalls(t, body.tools);
+      if (isProseDocument(p)) {
+        log.info(`Response is a prose document (${p.toolCalls.length} embedded fences), returning as text instead of executing`);
+        p = { hasToolCalls: false, toolCalls: [], textContent: t };
+      }
+      return p;
+    };
+    let parsed = reparse(fullText);
     log.info(`Parse result: hasToolCalls=${parsed.hasToolCalls}, count=${parsed.toolCalls.length}`);
 
     // Salvage stochastic turn-1 confabulation: M365's chat model sometimes claims it
@@ -434,7 +481,7 @@ export async function handleChatCompletion(
     // thread, cheap). Disable with M365_NO_CONFAB_RETRY; tune count with M365_CONFAB_RETRIES.
     const maxConfabRetries = process.env.M365_NO_CONFAB_RETRY
       ? 0
-      : Number(process.env.M365_CONFAB_RETRIES ?? 1);
+      : Number(process.env.M365_CONFAB_RETRIES ?? 2);
     // The model never actually acted if no assistant turn in the history carried a
     // tool call. Used to gate the hallucinated-completion retry (a model that did
     // real work called at least one tool), keeping false positives near zero.
@@ -448,13 +495,57 @@ export async function handleChatCompletion(
       if (!confab && !remoteArtifact && !halluc) break;
       const retryKind = remoteArtifact ? "Remote artifact completion" : confab ? "Confabulation" : "Hallucinated completion";
       log.info(`${retryKind} detected (no tool call) — forcing retry ${attempt + 1}/${maxConfabRetries}`);
-      text = remoteArtifact ? REMOTE_ARTIFACT_FORCE_PROMPT : confab ? CONFAB_FORCE_PROMPT : HALLUCINATION_FORCE_PROMPT;
+      const refusalSnippet = (parsed.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 100);
+      console.warn(`\n[m365-copilot-proxy] ⚠️ Intercepted Copilot refusal (${retryKind}): "${refusalSnippet}..." — forcing tool execution (attempt ${attempt + 1}/${maxConfabRetries})`);
+      text = remoteArtifact
+        ? REMOTE_ARTIFACT_FORCE_PROMPT
+        : confab
+          ? (everActed ? MID_TASK_CONFAB_FORCE_PROMPT : CONFAB_FORCE_PROMPT)
+          : HALLUCINATION_FORCE_PROMPT;
       const retry = await runBuffered();
       if ("error" in retry) return { kind: "error", resp: retry.error };
       conv.sentMessageCount = body.messages.length;
       fullText = retry.fullText;
-      parsed = parseToolCalls(fullText, body.tools);
+      parsed = reparse(fullText);
       log.info(`After forcing retry: hasToolCalls=${parsed.hasToolCalls}, count=${parsed.toolCalls.length}`);
+      if (parsed.hasToolCalls) {
+        console.log(`[m365-copilot-proxy] ✅ Forced Copilot to emit ${parsed.toolCalls.length} tool call(s): [${parsed.toolCalls.map((c) => c.name).join(", ")}]\n`);
+      } else {
+        console.warn(`[m365-copilot-proxy] ⚠️ Forcing retry attempt ${attempt + 1} did not yield tool calls.\n`);
+      }
+    }
+
+    // If confabulation persists in this thread, try once in a fresh M365 conversation
+    // to escape refusal-poisoned thread state.
+    if (!parsed.hasToolCalls && looksLikeConfabulation(parsed.textContent)) {
+      log.info("Confabulation persisted in thread — retrying once in a fresh M365 conversation");
+      session.newConversation();
+      text = formatMessages(body.messages, body.tools, body.tool_choice, session.conversationId, "softened");
+      const freshRetry = await runBuffered();
+      if (!("error" in freshRetry)) {
+        conv.sentMessageCount = body.messages.length;
+        fullText = freshRetry.fullText;
+        parsed = reparse(fullText);
+        log.info(`After fresh-conversation retry: hasToolCalls=${parsed.hasToolCalls}`);
+        if (parsed.hasToolCalls) {
+          console.log(`[m365-copilot-proxy] ✅ Fresh-conversation retry yielded ${parsed.toolCalls.length} tool call(s).\n`);
+        }
+      }
+    }
+
+    // Fail-closed on persistent confabulation: never return an active refusal as text,
+    // which poisons the harness conversation history forever.
+    if (!parsed.hasToolCalls && looksLikeConfabulation(parsed.textContent)) {
+      log.info("Refusal persisted after fresh conversation — failing closed to prevent history poisoning");
+      return {
+        kind: "error",
+        resp: jsonResponse(502, {
+          error: {
+            message: "M365 Copilot declined tool execution for this prompt. Please rephrase with explicit action verbs (e.g. 'Inspect the repository and implement...').",
+            type: "tool_execution_refused",
+          },
+        }),
+      };
     }
 
     // Never pass a remote M365 artifact off as a successful local edit. A retry
@@ -478,25 +569,16 @@ export async function handleChatCompletion(
       };
     }
 
-    // Document guard: the shell-routing parser turns every ```bash block into a
-    // tool call, so a model that ANSWERS with a markdown document full of code
-    // fences (e.g. "here's a simplified README") would get its own answer executed
-    // as shell. Detect that shape (multiple fences + prose) and return the document
-    // as plain text instead of running it. See isProseDocument (chosen empirically).
-    if (isProseDocument(parsed)) {
-      log.info(`Response is a prose document (${parsed.toolCalls.length} embedded fences), returning as text instead of executing`);
-      parsed = { hasToolCalls: false, toolCalls: [], textContent: fullText };
-    }
 
-    // Fail-closed: if model mixed text with tool calls, strip text and re-prompt once.
-    // This enforces the "output ONLY a tool call" contract.
+
+    // Fail-closed: if model mixed text with tool calls, capture text as reasoning and strip text.
+    // This enforces the "output ONLY a tool call" contract while preserving reasoning for clients.
     if (parsed.hasToolCalls && parsed.textContent) {
       const extraText = parsed.textContent.trim();
       if (extraText.length > 0) {
-        log.info(`Mixed output detected (${extraText.length} chars of text alongside ${parsed.toolCalls.length} tool calls), stripping text`);
-        // Strip the text — the tool calls are what the client needs.
-        // Log the stripped text for debugging but don't send it downstream.
-        log.debug("Stripped text:", trunc(extraText, 500));
+        log.info(`Mixed output detected (${extraText.length} chars of text alongside ${parsed.toolCalls.length} tool calls), capturing as reasoning`);
+        extractedReasoning = extraText;
+        log.debug("Captured reasoning:", trunc(extraText, 500));
         parsed = { ...parsed, textContent: null };
       }
     }
@@ -515,35 +597,91 @@ export async function handleChatCompletion(
           replyText = fullText;
         }
         log.info("Reply tool detected, converting to text response");
-        return { kind: "text", text: replyText };
+        return { kind: "text", text: replyText, reasoning: extractedReasoning };
       }
 
       if (realToolCalls.length > 0) {
         parsed.toolCalls = realToolCalls;
       }
 
-      // Enforce one tool call per turn unless explicitly opted out. M365 — the
-      // reasoning tones especially — batches its whole plan into a single
-      // response. Executing a batch runs later steps on guessed state and lets a
-      // premature success claim ride along at the end. Keeping only the first
-      // call forces a real step-by-step loop where each call reacts to the
-      // previous tool_response. Set M365_ALLOW_MULTI_TOOL to restore batching.
-      if (!process.env.M365_ALLOW_MULTI_TOOL && parsed.toolCalls.length > 1) {
+      // When all batched calls are shell commands (e.g. bash), merge them into
+      // a single multi-command script so all requested commands execute together
+      // rather than silently dropping subsequent commands.
+      const allShell = parsed.toolCalls.every(tc => /^(bash|sh|shell|zsh|run|run_command|execute_command)$/i.test(tc.function.name));
+      if (allShell && parsed.toolCalls.length > 1) {
+        try {
+          const combinedCommands = parsed.toolCalls
+            .map(tc => {
+              const args = typeof tc.function.arguments === "string" ? JSON.parse(tc.function.arguments) : tc.function.arguments;
+              return (args.command || args.cmd || args.script || "").trim();
+            })
+            .filter(Boolean)
+            .join("\n\n");
+          if (combinedCommands) {
+            log.info(`Merged ${parsed.toolCalls.length} shell blocks into a single ${parsed.toolCalls[0].function.name} call`);
+            parsed.toolCalls = [{
+              ...parsed.toolCalls[0],
+              function: {
+                ...parsed.toolCalls[0].function,
+                arguments: JSON.stringify({ command: combinedCommands }),
+              }
+            }];
+          }
+        } catch {
+          parsed.toolCalls = [parsed.toolCalls[0]];
+        }
+      } else if (!process.env.M365_ALLOW_MULTI_TOOL && parsed.toolCalls.length > 1) {
         log.info(`One-call-per-turn: keeping ${parsed.toolCalls[0].function.name}, dropping ${parsed.toolCalls.length - 1} batched call(s)`);
         parsed.toolCalls = [parsed.toolCalls[0]];
+      }
+
+      // Ensure shell tool calls have a concise first-line summary comment
+      // so Pi's collapsed view shows a clean title rather than an entire raw script.
+      for (const tc of parsed.toolCalls) {
+        if (/^(bash|sh|shell|zsh|run|run_command|execute_command)$/i.test(tc.function.name)) {
+          try {
+            const args = typeof tc.function.arguments === "string" ? JSON.parse(tc.function.arguments) : tc.function.arguments;
+            let cmd = (args.command || args.cmd || args.script || "").trim();
+            if (cmd && !cmd.startsWith("#")) {
+              const lines = cmd.split("\n").map(l => l.trim()).filter(Boolean);
+              if (lines.length > 1) {
+                const candidate = lines.find(l => !/^timeout:\s*\d+/i.test(l)) || lines[0];
+                const summary = candidate.length > 60 ? candidate.slice(0, 57) + "..." : candidate;
+                if (summary) {
+                  args.command = `# ${summary}\n${cmd}`;
+                  tc.function.arguments = JSON.stringify(args);
+                }
+              }
+            }
+          } catch {}
+        }
       }
     }
 
     if (parsed.hasToolCalls && parsed.toolCalls.length > 0) {
-      return { kind: "tools", toolCalls: parsed.toolCalls };
+      return { kind: "tools", toolCalls: parsed.toolCalls, reasoning: extractedReasoning };
     }
-    return { kind: "text", text: fullText };
+    const thinkMatch = fullText.match(/<(think|thought)>([\s\S]*?)<\/\1>/i);
+    let finalText = fullText;
+    let proseReasoning = extractedReasoning;
+    if (thinkMatch) {
+      proseReasoning = (proseReasoning ? proseReasoning + "\n\n" : "") + thinkMatch[2].trim();
+      finalText = fullText.replace(thinkMatch[0], "").trim();
+    }
+    return { kind: "text", text: finalText, reasoning: proseReasoning };
   } else {
     // No tools — stream deltas live (onDelta) while buffering for the retry logic.
     const result = await runBuffered(onDelta);
     if ("error" in result) return { kind: "error", resp: result.error };
     conv.sentMessageCount = body.messages.length;
-    return { kind: "text", text: result.fullText };
+    const thinkMatch = result.fullText.match(/<(think|thought)>([\s\S]*?)<\/\1>/i);
+    let finalText = result.fullText;
+    let proseReasoning: string | undefined;
+    if (thinkMatch) {
+      proseReasoning = thinkMatch[2].trim();
+      finalText = result.fullText.replace(thinkMatch[0], "").trim();
+    }
+    return { kind: "text", text: finalText, reasoning: proseReasoning };
   }
   } // end produce()
 
@@ -557,13 +695,30 @@ export async function handleChatCompletion(
     if (p.kind === "tools") {
       return jsonResponse(200, {
         id: completionId, object: "chat.completion", created, model,
-        choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: p.toolCalls }, finish_reason: "tool_calls" }],
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            ...(p.reasoning ? { reasoning_content: p.reasoning } : {}),
+            tool_calls: p.toolCalls
+          },
+          finish_reason: "tool_calls"
+        }],
         usage: usage(),
       });
     }
     return jsonResponse(200, {
       id: completionId, object: "chat.completion", created, model,
-      choices: [{ index: 0, message: { role: "assistant", content: p.text }, finish_reason: outputFinishReason(p.text) }],
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: p.text,
+          ...(p.reasoning ? { reasoning_content: p.reasoning } : {}),
+        },
+        finish_reason: outputFinishReason(p.text)
+      }],
       usage: usage(),
     });
   }
@@ -606,10 +761,16 @@ export async function handleChatCompletion(
           // HTTP 200 is already committed, so surface the failure as an in-stream error chunk.
           send({ ...base, error: { message, type: "upstream_error" } });
         } else if (p.kind === "tools") {
+          if (p.reasoning) {
+            send({ ...base, choices: [{ index: 0, delta: { reasoning_content: p.reasoning }, finish_reason: null }] });
+          }
           p.toolCalls.forEach((tc, i) =>
             send({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } }] }, finish_reason: null }] }));
           send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], ...(includeUsage ? { usage: usage() } : {}) });
         } else {
+          if (p.reasoning && !sent) {
+            send({ ...base, choices: [{ index: 0, delta: { reasoning_content: p.reasoning }, finish_reason: null }] });
+          }
           // Emit only what wasn't already streamed live: the whole text if nothing was
           // (tool-mode prose fallback, or a fully-buffered turn), or just the tail when
           // live deltas already covered a prefix. If `sent` somehow isn't a prefix of

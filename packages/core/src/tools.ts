@@ -168,10 +168,23 @@ export function formatMessages(
     parts.push(`<conversation_id>${conversationId}</conversation_id>`);
   }
 
+  const systemMessages = messages.filter((m) => m.role === "system");
+  const nonSystemMessages = messages.filter((m) => m.role !== "system");
+  const customSystemPrompt = systemMessages
+    .map((m) => getMessageContent(m))
+    .filter(Boolean)
+    .join("\n\n");
+
   const effectiveTools = tools ? maybeInjectReplyTool(tools) : tools;
   const specMap = effectiveTools ? buildSpecMap(effectiveTools) : null;
   if (effectiveTools && effectiveTools.length > 0 && toolChoice !== "none") {
-    parts.push(`<system>\n${formatToolDefinitions(effectiveTools, framingVariant)}${formatToolChoiceInstruction(toolChoice)}\n</system>`);
+    let combinedSystem = formatToolDefinitions(effectiveTools, framingVariant) + formatToolChoiceInstruction(toolChoice);
+    if (customSystemPrompt) {
+      combinedSystem = customSystemPrompt + "\n\n" + combinedSystem;
+    }
+    parts.push(`<system>\n${combinedSystem}\n</system>`);
+  } else if (customSystemPrompt) {
+    parts.push(`<system>\n${customSystemPrompt}\n</system>`);
   }
 
   // Correlate each tool result back to the call that produced it, so the model
@@ -187,7 +200,7 @@ export function formatMessages(
     }
   }
 
-  for (const m of messages) {
+  for (const m of nonSystemMessages) {
     if (m.role === "assistant" && m.tool_calls && m.tool_calls.length > 0) {
       const calls = m.tool_calls.map((tc) => {
         const rawArgs = tc.function.arguments;
@@ -249,12 +262,9 @@ export interface ParseResult {
 const CONFABULATION_PATTERNS: RegExp[] = [
   /return(?:ing|s|ed)?\s+no\s+(?:output|results?|content)/i,
   /no\s+(?:output|results?|content|data)\s+(?:was\s+|were\s+)?(?:return|provid|present)/i, // "no content was returned"
-  // The `to` is optional — matches both "unable TO access" and "can't access" (the
-  // old `to?` made the *t* mandatory, so "can't inspect"/"can't access" slipped
-  // through). `execute`/`retrieve`/`fetch` added: the give-up reflex phrases them
-  // ("unable to execute or retrieve any output") and they were absent from the list.
-  /(?:unable|not able|can.?t|cannot)\s+(?:to\s+)?(?:access|inspect|list|read|run|execute|retrieve|fetch|locate|see|open)/i,
-  /don.?t\s+have\s+access/i,
+  /(?:unable|not able|can.?t|cannot)\s+(?:to\s+)?(?:[a-z]+\s+)?(?:access|inspect|list|read|run|execute|retrieve|fetch|locate|see|open|modify|edit|update|change|write|apply|verify)/i,
+  /\b(?:can.?t|cannot|unable\s+to|not\s+able\s+to)\s+(?:truthfully|honestly)\b/i,
+  /(?:don.?t|do\s+not)\s+have\s+(?:access|the\s+ability|permission)/i,
   /no\s+(?:longer\s+have|access\s+to)/i,   // "no access to" + "no longer have access/the tools"
   /lost\s+(?:access|my\s+access|the\s+ability)/i,
   // Mid-conversation give-up (F12.11, magic model): after a real tool call it claims
@@ -265,7 +275,11 @@ const CONFABULATION_PATTERNS: RegExp[] = [
   // "the live file-editing tools ... are not available to me here" (magic model, F12.11):
   // it claims its own tools are gone, then delegates the edit back to the user.
   /(?:tool|editor|shell|command|file-?editing)s?[^.\n]{0,40}\b(?:not\s+available|unavailable|aren.?t\s+available|isn.?t\s+available|are\s+not\s+accessible)/i,
-  /(?:can.?t|cannot|not\s+able\s+to|unable\s+to)\s+(?:directly\s+)?(?:edit|modify|write\s+to|change|save|create|open)\s+(?:the\s+|any\s+|to\s+)?files?/i,
+  // Asks the user to paste output manually instead of running it
+  /(?:please\s+)?(?:paste|provide)\s+(?:the\s+output|either|git\s+diff|the\s+relevant)/i,
+  /\bno\s+[^.\n]{0,60}\b(?:tool|editor|shell|command|execution|filesystem)\b[^.\n]{0,60}\b(?:is|are)?\s*(?:currently\s+)?(?:available|accessible|provided|enabled|exposed)/i,
+  /(?:can.?t|cannot|not\s+able\s+to|unable\s+to)\s+(?:[a-z]+\s+)?(?:edit|modify|write\s+to|change|save|create|open|apply)\s+(?:the\s+|any\s+|to\s+)?(?:files?|repositor(?:y|ies)|repo|codebase|project|directory)/i,
+  /(?:can.?t|cannot|unable\s+to)\s+(?:[a-z]+\s+)?(?:modify|edit|write|update|apply)\b[^.\n]{0,40}\bin\s+this\s+(?:interface|response|chat|session)/i,
   /paste\s+(?:the\s+)?(?:contents?|files?|code|them)/i,
   /provide\s+(?:the\s+)?(?:contents?|files?)/i,
   /(?:environment|shell|tool)\s+(?:isn.?t|is not|aren.?t|are not|appears? to be)\s+(?:return|provid|respond|work|access)/i,
@@ -286,6 +300,7 @@ const CONFABULATION_PATTERNS: RegExp[] = [
   // GPT-5.6 can truthfully describe M365's remote runtime as if it were the
   // caller's environment. This wording slipped past the older can't-access
   // patterns because it says the session "does not expose" the filesystem.
+  /(?:chat\s+)?(?:interface|session|environment|runtime)\s+(?:does\s+not|doesn.?t|cannot)\s+(?:currently\s+)?(?:expose|mount|provide|have|support)\s+[\s\S]{0,80}\b(?:tool|filesystem|shell|execution)/i,
   /(?:session|environment|runtime)\s+(?:does\s+not|doesn.?t|cannot)\s+(?:expose|mount|provide)\s+(?:the\s+)?(?:local\s+)?(?:repository\s+)?filesystem/i,
   /(?:my|the)\s+filesystem\s+(?:only\s+)?(?:contained|contains|has)[\s\S]{0,80}\/mnt\/data/i,
 ];
@@ -387,6 +402,14 @@ export function looksLikeConfabulation(text: string | null): boolean {
 export function isProseDocument(parsed: ParseResult): boolean {
   if (!parsed.hasToolCalls || parsed.toolCalls.length < 2) return false;
   const prose = parsed.textContent ? parsed.textContent.trim() : "";
+
+  // If the model is explicitly telling the user/runtime to run or execute commands,
+  // this is an execution turn that must be routed to the shell, not a written document.
+  const isExecutionRequest =
+    /(?:please\s+)?(?:run|execute|inspect|try|apply)\s+(?:the\s+)?(?:following|command|commands|script|locally|in\s+the\s+terminal)/i.test(prose) ||
+    /(?:command|commands|step|investigation|inspection)\s+(?:should|would|to)\s+be\s*:/i.test(prose);
+  if (isExecutionRequest) return false;
+
   // Distinguish a coding-agent ACTION turn from a written DOCUMENT.
   //   ACTION  (execute it): a short preamble + a couple command fences, e.g. Claude's
   //           "I'll inspect the files first.\n```bash ls```\n```bash cat```" — common,
