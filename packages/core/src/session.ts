@@ -17,7 +17,7 @@ import {
   shouldAutoConfirm,
   ACTION_ALLOWED_MESSAGE_TYPES,
 } from "./native-actions.js";
-import { createLogger, trunc } from "./log.js";
+import { createLogger, trunc, trace } from "./log.js";
 
 const RS = "\x1E";
 const log = createLogger("session");
@@ -473,7 +473,7 @@ export class CopilotSession {
 
       ws.on("message", (data: WebSocket.RawData) => {
         const raw = data.toString();
-        log.debug("WS recv:", trunc(raw, 500));
+        if (trace) log.debug("WS recv:", trunc(raw, 500));
         const frames = raw.split(RS).filter((f) => f.length > 0);
 
         for (const frame of frames) {
