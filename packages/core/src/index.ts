@@ -65,6 +65,7 @@ export {
 
 export {
   formatMessages,
+  formatRawMessages,
   formatToolDefinitions,
   formatToolChoiceInstruction,
   getMessageContent,

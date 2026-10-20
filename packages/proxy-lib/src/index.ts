@@ -104,11 +104,11 @@ export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
       return withCors(json(200, HEALTH_PAYLOAD));
     }
 
-    if (method === "GET" && pathname === "/v1/models") {
+    if (method === "GET" && (pathname === "/v1/models" || pathname === "/v1/raw/models" || pathname === "/raw/v1/models")) {
       return withCors(json(200, buildModelsPayload()));
     }
 
-    if (method === "POST" && pathname === "/v1/chat/completions") {
+    if (method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/v1/raw/chat/completions" || pathname === "/raw/v1/chat/completions")) {
       let body: ReturnType<typeof ChatCompletionRequest.parse>;
       try {
         body = ChatCompletionRequest.parse(await req.json());
@@ -117,8 +117,9 @@ export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
           json(400, { error: { message: err.message, type: "invalid_request_error" } }),
         );
       }
+      const raw = pathname.includes("/raw");
       // req.signal aborts when the client disconnects → cancels the M365 turn.
-      return withCors(await handleChatCompletion(body, pool, { signal: req.signal }));
+      return withCors(await handleChatCompletion(body, pool, { signal: req.signal, raw }));
     }
 
     return withCors(

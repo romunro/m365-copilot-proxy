@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseToolCalls, formatToolDefinitions, looksLikeConfabulation, looksLikeHallucinatedCompletion, looksLikeRemoteArtifactCompletion, isProseDocument } from "./tools.js";
+import { parseToolCalls, formatToolDefinitions, formatRawMessages, looksLikeConfabulation, looksLikeHallucinatedCompletion, looksLikeRemoteArtifactCompletion, isProseDocument } from "./tools.js";
 
 describe("parseToolCalls", () => {
   it("should parse a clean tool call with no extra text", () => {
@@ -487,5 +487,29 @@ describe("formatToolDefinitions", () => {
     expect(output).toContain("```read_file");
     expect(output).toContain("<tools>");
     expect(output).toContain("</tools>");
+  });
+});
+
+describe("formatRawMessages", () => {
+  it("passes single user turn without any wrapper tags", () => {
+    const messages = [{ role: "user" as const, content: "Hi" }];
+    expect(formatRawMessages(messages)).toBe("Hi");
+  });
+
+  it("prepends system prompt cleanly without [SYSTEM CONTEXT] or XML", () => {
+    const messages = [
+      { role: "system" as const, content: "You are a planner." },
+      { role: "user" as const, content: "Analyze the architecture." },
+    ];
+    expect(formatRawMessages(messages)).toBe("You are a planner.\n\nAnalyze the architecture.");
+  });
+
+  it("formats multi-turn plain text conversation", () => {
+    const messages = [
+      { role: "user" as const, content: "Hello" },
+      { role: "assistant" as const, content: "Hi there!" },
+      { role: "user" as const, content: "What is 2+2?" },
+    ];
+    expect(formatRawMessages(messages)).toBe("User: Hello\n\nAssistant: Hi there!\n\nUser: What is 2+2?");
   });
 });

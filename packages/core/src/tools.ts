@@ -244,6 +244,46 @@ export function formatMessages(
   return parts.join("\n\n");
 }
 
+/**
+ * Formats messages for raw pass-through completion without injecting
+ * tool definitions, XML wrapper tags, or prompt demarcation envelopes.
+ */
+export function formatRawMessages(messages: ChatCompletionMessage[]): string {
+  const parts: string[] = [];
+  const systemMessages = messages.filter((m) => m.role === "system");
+  const nonSystemMessages = messages.filter((m) => m.role !== "system");
+
+  const customSystemPrompt = systemMessages
+    .map((m) => getMessageContent(m))
+    .filter(Boolean)
+    .join("\n\n");
+
+  if (customSystemPrompt) {
+    parts.push(customSystemPrompt);
+  }
+
+  // If there's only one user message and no previous history, pass it directly
+  if (nonSystemMessages.length === 1 && nonSystemMessages[0].role === "user") {
+    parts.push(getMessageContent(nonSystemMessages[0]));
+    return parts.join("\n\n");
+  }
+
+  // Multi-turn plain conversation
+  for (const m of nonSystemMessages) {
+    const content = getMessageContent(m);
+    if (!content) continue;
+    if (m.role === "user") {
+      parts.push(`User: ${content}`);
+    } else if (m.role === "assistant") {
+      parts.push(`Assistant: ${content}`);
+    } else {
+      parts.push(`${m.role}: ${content}`);
+    }
+  }
+
+  return parts.join("\n\n");
+}
+
 // --- Parsing ---
 
 export interface ParsedToolCall {

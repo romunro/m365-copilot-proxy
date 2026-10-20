@@ -5,6 +5,7 @@ import {
   trunc,
   getToneForModel,
   formatMessages,
+  formatRawMessages,
   parseToolCalls,
   looksLikeConfabulation,
   looksLikeHallucinatedCompletion,
@@ -75,7 +76,7 @@ const REMOTE_ARTIFACT_FORCE_PROMPT =
 // uses to ask for a continuation. Tune/disable via env (0 disables).
 const OUTPUT_CHAR_CEILING = process.env.M365_OUTPUT_CHAR_CEILING !== undefined
   ? Number(process.env.M365_OUTPUT_CHAR_CEILING)
-  : 12_000;
+  : 11_000;
 
 /** "length" when the answer is at/over the empirical output ceiling, else "stop". */
 function outputFinishReason(text: string): "stop" | "length" {
@@ -221,6 +222,23 @@ function formatDeltaMessages(messages: ParsedMessage[], allMessages?: ParsedMess
   return parts.join("\n\n");
 }
 
+function formatRawDeltaMessages(messages: ParsedMessage[]): string {
+  const parts: string[] = [];
+  for (const m of messages) {
+    if (m.role === "assistant" || m.role === "system") {
+      continue;
+    }
+    const content = getMessageContent(m);
+    if (!content) continue;
+    if (m.role === "user") {
+      parts.push(content);
+    } else {
+      parts.push(`${m.role}: ${content}`);
+    }
+  }
+  return parts.join("\n\n");
+}
+
 // --- Main handler ---
 
 /**
@@ -230,11 +248,12 @@ function formatDeltaMessages(messages: ParsedMessage[], allMessages?: ParsedMess
 export async function handleChatCompletion(
   body: ChatBody,
   pool: SessionPool,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; raw?: boolean } = {},
 ): Promise<Response> {
   const conv = pool.resolve(body.messages);
   const { session } = conv;
-  const hasTools = body.tools && body.tools.length > 0 && body.tool_choice !== "none";
+  const isRaw = !!opts.raw;
+  const hasTools = !isRaw && body.tools && body.tools.length > 0 && body.tool_choice !== "none";
   const model = body.model;
 
   // Claude (Claude_Sonnet tone) tool-calls reliably AGENT-LESS (probe: 4/4 ```bash,
@@ -254,7 +273,7 @@ export async function handleChatCompletion(
   // agent-suppressed — the confab quadrant we observed. One resolved tone drives both.
   const tone = getToneForModel(model);
   const isClaudeTone = /^Claude_/i.test(tone);
-  const useToolAgent = !!hasTools && (process.env.M365_FORCE_AGENT === "1" || !isClaudeTone);
+  const useToolAgent = !isRaw && !!hasTools && (process.env.M365_FORCE_AGENT === "1" || !isClaudeTone);
 
   // Format message: full prompt on first turn, delta on follow-ups.
   // M365 is stateful — it remembers everything from prior turns,
@@ -262,7 +281,22 @@ export async function handleChatCompletion(
   const isFirstTurn = session.turnCount === 0;
   const convId = session.conversationId;
   let text: string;
-  if (isFirstTurn || conv.sentMessageCount === 0) {
+  if (isRaw) {
+    if (isFirstTurn || conv.sentMessageCount === 0) {
+      text = formatRawMessages(body.messages);
+      log.info(`Chat completion (RAW): model=${model}, stream=${body.stream}, messages=${body.messages.length}, turn=${session.turnCount}, mode=full, cid=${convId}`);
+    } else {
+      const newMessages = body.messages.slice(conv.sentMessageCount);
+      const delta = newMessages.length > 0 ? formatRawDeltaMessages(newMessages) : "";
+      if (delta.length > 0) {
+        text = delta;
+        log.info(`Chat completion (RAW): model=${model}, stream=${body.stream}, messages=${body.messages.length}, new=${newMessages.length}, turn=${session.turnCount}, mode=delta, cid=${convId}`);
+      } else {
+        text = "Please continue.";
+        log.info(`Chat completion (RAW): model=${model}, stream=${body.stream}, messages=${body.messages.length}, turn=${session.turnCount}, mode=retry, cid=${convId}`);
+      }
+    }
+  } else if (isFirstTurn || conv.sentMessageCount === 0) {
     text = formatMessages(body.messages, body.tools, body.tool_choice, convId);
     log.info(`Chat completion: model=${model}, stream=${body.stream}, messages=${body.messages.length}, turn=${session.turnCount}, mode=full, cid=${convId}`);
   } else {
