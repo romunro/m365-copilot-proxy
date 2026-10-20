@@ -11,8 +11,8 @@ const MODEL_TONES: Record<string, string> = {
   "auto": "magic",
 
   // Generic modes
-  "quick": "Gpt_Quick",
-  "think-deeper": "Gpt_Reasoning",
+  "quick": "magic",
+  "think-deeper": "Gpt_5_5_Reasoning",
 
   // Claude (real Anthropic models, confirmed via self-id) — chat + reasoning.
   "claude": "Claude_Sonnet",
@@ -26,7 +26,9 @@ const MODEL_TONES: Record<string, string> = {
   "gpt-5.5-quick": "Gpt_5_5_Chat",
   "gpt-5.5-think-deeper": "Gpt_5_5_Reasoning",
 
-  // GPT-5.6 (live-validated 2026-08-06; M365 currently exposes reasoning only)
+  // GPT-5.6
+  "gpt-5.6": "magic",
+  "gpt-5.6-quick": "magic",
   "gpt-5.6-think-deeper": "Gpt_5_6_Reasoning",
 
   // GPT-5.4

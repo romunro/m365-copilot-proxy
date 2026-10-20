@@ -180,11 +180,11 @@ export function formatMessages(
   if (effectiveTools && effectiveTools.length > 0 && toolChoice !== "none") {
     let combinedSystem = formatToolDefinitions(effectiveTools, framingVariant) + formatToolChoiceInstruction(toolChoice);
     if (customSystemPrompt) {
-      combinedSystem = customSystemPrompt + "\n\n" + combinedSystem;
+      combinedSystem = "[YOUR PERSONA AND IDENTITY]\n" + customSystemPrompt + "\n[END PERSONA]\n\n" + combinedSystem;
     }
-    parts.push(`<system>\n${combinedSystem}\n</system>`);
+    parts.push(`[SYSTEM CONTEXT]\n${combinedSystem}\n[/SYSTEM CONTEXT]`);
   } else if (customSystemPrompt) {
-    parts.push(`<system>\n${customSystemPrompt}\n</system>`);
+    parts.push(`[SYSTEM CONTEXT]\n${customSystemPrompt}\n[/SYSTEM CONTEXT]`);
   }
 
   // Correlate each tool result back to the call that produced it, so the model
@@ -234,6 +234,8 @@ export function formatMessages(
       // context (a directory listing vs file contents vs a command's stdout).
       const cmdAttr = meta?.summary ? ` command="${meta.summary}"` : "";
       parts.push(`<tool_response tool="${name}"${cmdAttr}>\n${getMessageContent(m)}\n</tool_response>`);
+    } else if (m.role === "user") {
+      parts.push(`[USER'S ACTUAL QUERY - YOU MUST ACT ON THIS]\n${getMessageContent(m)}\n[/USER QUERY]`);
     } else {
       parts.push(`<${m.role}>\n${getMessageContent(m)}\n</${m.role}>`);
     }

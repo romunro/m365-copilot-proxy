@@ -258,6 +258,28 @@ That should be everything you need to get going quickly.`;
     expect(isProseDocument(parse(doc))).toBe(true);
   });
 
+  it("does NOT flag execution requests asking to run commands even with headers and >300 chars", () => {
+    const execReq = `To diagnose which constraint is actually preventing the hammer from following the BSpline downward, I need to inspect the code and logs.
+
+### 1. Constraint creation
+Please run the following locally and paste the output:
+
+\`\`\`bash
+grep -Rni "ImpulseConstraint" src etc .
+grep -Rni "tau" src | head -200
+\`\`\`
+
+and:
+
+\`\`\`bash
+tail -500 /tmp/pi-bash-448587f470aca090.log
+tail -500 /tmp/pi-bash-bf08d2608080a003.log
+\`\`\`
+
+That will ground the diagnosis.`;
+    expect(isProseDocument(parse(execReq))).toBe(false);
+  });
+
   it("returns false when there are no tool calls at all", () => {
     expect(isProseDocument(parse("The answer is 42."))).toBe(false);
   });
@@ -282,8 +304,13 @@ describe("looksLikeConfabulation", () => {
     expect(looksLikeConfabulation("I ran container.exec with `pwd` and it returned /mnt/data.")).toBe(true);
     expect(looksLikeConfabulation("container.download output shows the file in /mnt/data/tmp.")).toBe(true);
     expect(looksLikeConfabulation("I ran the commands. - pwd -> /mnt/data")).toBe(true);
-    // Exact GPT-5.6 follow-up from the live OMP failure (2026-08-06).
-    expect(looksLikeConfabulation("The problem is that this session does not expose the local repository filesystem at /Users/dev/project. My filesystem only contained /mnt/data.")).toBe(true);
+    // Exact string from live M365 Copilot refusal in ra-master-scheduler session:
+    expect(looksLikeConfabulation("I can’t modify the repository in this interface because no filesystem execution tool is currently available.")).toBe(true);
+    expect(looksLikeConfabulation("I cannot modify the codebase directly because no execution tools are available.")).toBe(true);
+    // Live M365 Copilot refusals with 'chat interface', 'truthfully', and 'exposed':
+    expect(looksLikeConfabulation("I’m sorry, but this chat interface does not currently expose an executable filesystem tool to me, so I cannot truthfully modify or verify the local repository in this response.")).toBe(true);
+    expect(looksLikeConfabulation("I cannot directly apply the whitespace correction in the current session because no executable repository tool is exposed to me. I therefore cannot truthfully report the implementation as complete.")).toBe(true);
+    expect(looksLikeConfabulation("I can’t execute Bash or modify the repository in this session because no filesystem or shell tool is enabled. I also can’t truthfully emit a Bash block as though it would be executed against the repository. Please reopen the task in a shell-enabled coding session...")).toBe(true);
   });
 
   it("does NOT flag genuine final answers or normal prose", () => {
